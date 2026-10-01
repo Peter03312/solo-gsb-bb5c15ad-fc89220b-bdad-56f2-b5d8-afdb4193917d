@@ -375,6 +375,10 @@ class LoadingActuals(Base):
         DateTime(timezone=True), default=_utcnow
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # 实绩版本：首次登记为 1，每成功更正一条事件 +1（更正乐观锁基准）
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
     events: Mapped[list["LoadingActualEvent"]] = relationship(
         back_populates="actuals", cascade="all, delete-orphan"
@@ -382,10 +386,14 @@ class LoadingActuals(Base):
     baseline_items: Mapped[list["LoadingActualBaselineItem"]] = relationship(
         back_populates="actuals", cascade="all, delete-orphan"
     )
+    corrections: Mapped[list["LoadingActualCorrection"]] = relationship(
+        back_populates="actuals", cascade="all, delete-orphan"
+    )
     plan: Mapped[Plan] = relationship()
 
     __table_args__ = (
         CheckConstraint("baseline_crane_count > 0", name="ck_actuals_cranes"),
+        CheckConstraint("version >= 1", name="ck_actuals_version"),
     )
 
 
@@ -414,11 +422,15 @@ class LoadingActualBaselineItem(Base):
 
 
 class LoadingActualEvent(Base):
-    """逐箱实际开工/完工事件（只追加，事件流水号在方案内唯一）。
+    """逐箱实际开工/完工事件（事件流水号在方案内唯一）。
 
     事件允许晚到；服务按 (实际分钟, 同分钟完工先于开工, 到达先后) 重放。
     到达先后由自增 id 体现；任一事件使整条重放链非法则整次登记拒绝，
     已落库事件保持不变。
+
+    ``crane_no``/``minute`` 为**当前有效内容**（更正后就地更新）；
+    ``first_crane_no``/``first_minute`` 为**首次登记原值**，更正不改，
+    供原登记接口仍按首次登记内容识别同流水号重试与冲突，亦供更正历史溯源。
     """
 
     __tablename__ = "loading_actual_events"
@@ -432,6 +444,8 @@ class LoadingActualEvent(Base):
     container_no: Mapped[str] = mapped_column(String(64), nullable=False)
     crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
     minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_minute: Mapped[int] = mapped_column(Integer, nullable=False)
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -444,4 +458,54 @@ class LoadingActualEvent(Base):
                         name="ck_actual_event_type"),
         CheckConstraint("crane_no >= 1", name="ck_actual_event_crane"),
         CheckConstraint("minute >= 0", name="ck_actual_event_minute"),
+        CheckConstraint("first_crane_no >= 1", name="ck_actual_event_first_crane"),
+        CheckConstraint("first_minute >= 0", name="ck_actual_event_first_minute"),
+    )
+
+
+class LoadingActualCorrection(Base):
+    """已登记实绩事件的一次成功更正（只追加，方案内请求号唯一）。
+
+    更正只改事件的分钟或岸桥，沿用原流水号、事件类型与箱号。每次成功更正
+    后 :attr:`version` 递增并在此留存一条原值快照；重放整条链非法则整次
+    拒绝，事件、版本与本表均不变。同一 ``correction_request_no`` 同内容
+    重试幂等返回首次更正结果（不重复生效）。
+    """
+
+    __tablename__ = "loading_actual_corrections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actuals_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_actuals.id", ondelete="CASCADE"), index=True
+    )
+    correction_request_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 更正前（被取代）的分钟/岸桥
+    old_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    old_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 更正后（本次生效）的分钟/岸桥
+    new_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 更正成功后的实绩版本（首登为 1，首次更正为 2）
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    actuals: Mapped[LoadingActuals] = relationship(back_populates="corrections")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "actuals_id", "correction_request_no",
+            name="uq_actual_correction_request",
+        ),
+        CheckConstraint("event_type IN ('start', 'finish')",
+                        name="ck_correction_event_type"),
+        CheckConstraint("old_crane_no >= 1", name="ck_correction_old_crane"),
+        CheckConstraint("new_crane_no >= 1", name="ck_correction_new_crane"),
+        CheckConstraint("old_minute >= 0", name="ck_correction_old_minute"),
+        CheckConstraint("new_minute >= 0", name="ck_correction_new_minute"),
+        CheckConstraint("version >= 2", name="ck_correction_version"),
     )

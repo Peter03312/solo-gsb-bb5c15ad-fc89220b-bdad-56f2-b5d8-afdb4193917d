@@ -378,6 +378,27 @@ class ActualEventRegisterIn(BaseModel):
         return self
 
 
+# ---------- 已登记实绩事件更正 ----------
+
+
+class ActualEventCorrectionIn(ActualEventIn):
+    """更正请求：替代事件的完整内容（沿用原流水号、类型与箱号，只改分钟或岸桥）。"""
+
+    expected_version: int = Field(
+        ..., ge=1,
+        description="期望实绩版本（正整数）；须与服务当前版本一致，否则 409",
+    )
+    correction_request_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="更正请求号（非空），同一方案内唯一；同号同内容重试幂等返回首次结果",
+    )
+
+    @field_validator("correction_request_no")
+    @classmethod
+    def _request_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "更正请求号")
+
+
 class ActualBaselineEntryOut(BaseModel):
     container_no: str
     start_minute: int
@@ -422,13 +443,29 @@ class ActualEventOut(BaseModel):
     registered_at: str
 
 
+class ActualCorrectionOut(BaseModel):
+    correction_request_no: str
+    seq: int = Field(..., description="被更正事件的原流水号（沿用）")
+    event_type: str
+    container_no: str
+    old_minute: int = Field(..., description="更正前分钟（原值）")
+    old_crane_no: int = Field(..., description="更正前岸桥（原值）")
+    new_minute: int = Field(..., description="更正后分钟（本次生效）")
+    new_crane_no: int = Field(..., description="更正后岸桥（本次生效）")
+    version: int = Field(..., description="本次更正成功后的实绩版本")
+    created_at: str
+
+
 class ActualsOut(BaseModel):
     plan_id: str
     revision_no: int
     plan_status: str = Field(
         ..., description="confirmed=可继续登记；superseded=方案已被新修订取代，实绩只读"
     )
-    read_only: bool = Field(..., description="true=方案已被取代，不再接受登记")
+    read_only: bool = Field(..., description="true=方案已被取代，不再接受登记/更正")
+    version: int = Field(
+        ..., description="实绩版本：首次登记为 1，每成功更正一条事件递增 1"
+    )
     baseline_frozen_at: str
     baseline_crane_count: int
     baseline: list[ActualBaselineEntryOut]
@@ -439,7 +476,10 @@ class ActualsOut(BaseModel):
     replay_order: list[int] = Field(
         ..., description="按实际分钟重放（同分钟完工先于开工）后的事件流水号顺序"
     )
-    events: list[ActualEventOut] = Field(..., description="已登记事件（按流水号升序）")
+    events: list[ActualEventOut] = Field(..., description="当前有效事件（按流水号升序）")
+    corrections: list[ActualCorrectionOut] = Field(
+        ..., description="更正历史（按更正先后，即版本升序）"
+    )
     created_at: str
 
 

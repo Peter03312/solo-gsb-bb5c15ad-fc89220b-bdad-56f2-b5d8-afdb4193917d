@@ -1,0 +1,9 @@
+{
+  "seq": 2,
+  "event_type": "finish",
+  "container_no": "C001",
+  "crane_no": 1,
+  "minute": 8,
+  "expected_version": 1,
+  "correction_request_no": "CORR-20261001-0001"
+}

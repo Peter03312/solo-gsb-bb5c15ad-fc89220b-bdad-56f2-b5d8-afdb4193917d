@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.actuals import ActualEvent, ActualsReplayError, replay as replay_actuals
 from app.schemas import (
+    ActualEventCorrectionIn,
     ActualEventRegisterIn,
     ManifestIn,
     PlanConfirmIn,
@@ -988,7 +989,8 @@ def register_actual_events(
             )
 
         cursor.execute(
-            "SELECT id, baseline_crane_count FROM loading_actuals WHERE plan_id = ?",
+            "SELECT id, baseline_crane_count, version FROM loading_actuals "
+            "WHERE plan_id = ?",
             (plan_id,),
         )
         head = cursor.fetchone()
@@ -1026,11 +1028,14 @@ def register_actual_events(
                 (actuals_id, schedule_id),
             )
         else:
-            actuals_id, crane_count = head
+            actuals_id, crane_count, _version = head
 
-        # 已登记事件（seq -> 内容），用于幂等与冲突判定
+        # 已登记事件（seq -> 内容），用于幂等与冲突判定。
+        # 重放/比对取当前值；同流水号重试按**首次登记内容**识别，
+        # 故另取 first_* 原值（更正不改）。
         cursor.execute(
-            "SELECT seq, event_type, container_no, crane_no, minute, id "
+            "SELECT seq, event_type, container_no, crane_no, minute, id, "
+            "first_crane_no, first_minute "
             "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
             (actuals_id,),
         )
@@ -1041,13 +1046,17 @@ def register_actual_events(
         for seq, etype, cno, crane_no, minute in incoming:
             old = existing_by_seq.get(seq)
             if old is not None:
-                if (old[1], old[2], old[3], old[4]) == (etype, cno, crane_no, minute):
-                    continue  # 同流水号同内容：重试，原结果幂等返回
+                # 按首次登记内容识别重试（当前有效内容可能已被更正）
+                if (old[1], old[2], old[6], old[7]) == (
+                    etype, cno, crane_no, minute
+                ):
+                    continue  # 同流水号同首次内容：重试，原结果幂等返回
                 conn.rollback()
                 raise ConflictError(
-                    f"事件流水号 {seq} 已登记且内容不同（已登记："
-                    f"{old[1]} 箱 {old[2]} 桥 {old[3]} 第 {old[4]} 分钟），"
-                    "异内容冲突，本次登记被拒绝且记录不变"
+                    f"事件流水号 {seq} 已登记且首次内容不同（首次登记："
+                    f"{old[1]} 箱 {old[2]} 桥 {old[6]} 第 {old[7]} 分钟），"
+                    "异内容冲突，本次登记被拒绝且记录不变；如需修改已登记事件，"
+                    "请调用实绩更正接口"
                 )
             if crane_no > crane_count:
                 conn.rollback()
@@ -1095,9 +1104,11 @@ def register_actual_events(
             cursor.executemany(
                 "INSERT INTO loading_actual_events "
                 "(actuals_id, seq, event_type, container_no, crane_no, minute, "
-                "registered_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "first_crane_no, first_minute, registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (actuals_id, seq, etype, cno, crane_no, minute,
+                     crane_no, minute,
                      models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
                     for seq, etype, cno, crane_no, minute in new_rows
                 ],
@@ -1124,17 +1135,68 @@ def get_actuals(db: Session, plan_id: str) -> models.LoadingActuals:
     return _load_actuals_view(db, plan_id)
 
 
-def build_actuals_out(db: Session, actuals: models.LoadingActuals) -> dict:
-    """重放已登记事件，组装每箱状态、实际起止、相对冻结基线的偏差与未完箱。"""
+def _effective_event_rows(
+    db: Session, actuals_id: int, at_version: int | None = None
+) -> list:
+    """返回某版本时刻的有效事件行（SQLAlchemy 行：含首登原值与更正链）。
+
+    以首次登记内容（first_crane_no/first_minute）为起点，依次套用 version <=
+    at_version 的更正（只改分钟/岸桥，类型与箱号不变）；at_version=None 取全部。
+    事件按到达先后（自增 id）排序，供重放平局使用。
+    """
+    rows = list(db.scalars(
+        select(models.LoadingActualEvent)
+        .where(models.LoadingActualEvent.actuals_id == actuals_id)
+        .order_by(models.LoadingActualEvent.id)
+    ))
+    corrections = sorted(
+        (
+            c
+            for c in db.scalars(
+                select(models.LoadingActualCorrection)
+                .where(models.LoadingActualCorrection.actuals_id == actuals_id)
+            )
+            if at_version is None or c.version <= at_version
+        ),
+        key=lambda c: c.id,
+    )
+    current: dict[int, dict] = {
+        r.seq: {"crane_no": r.first_crane_no, "minute": r.first_minute}
+        for r in rows
+    }
+    for c in corrections:
+        current[c.seq] = {"crane_no": c.new_crane_no, "minute": c.new_minute}
+    # 挂到行对象上供组装使用（轻量动态属性）
+    for r in rows:
+        r._effective_crane_no = current[r.seq]["crane_no"]
+        r._effective_minute = current[r.seq]["minute"]
+    return rows
+
+
+def build_actuals_out(
+    db: Session,
+    actuals: models.LoadingActuals,
+    view_version: int | None = None,
+    view_plan_status: str | None = None,
+) -> dict:
+    """重放有效事件，组装每箱状态、偏差、未完箱、版本与更正历史。
+
+    :param view_version: 仅重放/呈现该版本时刻的有效内容（同请求号重试首次
+        更正结果时使用）；None 取当前版本。
+    :param view_plan_status: 覆盖方案状态（历史视图固定为首次更正时的 confirmed，
+        保证幂等返回与首次结果完全一致）；None 取实际方案状态。
+    """
+    event_rows = _effective_event_rows(db, actuals.id, view_version)
     events = [
         ActualEvent(
             seq=e.seq, event_type=e.event_type, container_no=e.container_no,
-            crane_no=e.crane_no, minute=e.minute, arrival_id=e.id,
+            crane_no=e._effective_crane_no, minute=e._effective_minute,
+            arrival_id=e.id,
         )
-        for e in sorted(actuals.events, key=lambda x: x.id)
+        for e in event_rows
     ]
     plan_items = [(i.container_no, i.stack, i.tier) for i in actuals.plan.items]
-    # 已落库事件必然通过重放校验（防御性仍调用以得到状态）
+    # 已落库的有效事件必然通过重放校验（防御性仍调用以得到状态）
     result = replay_actuals(events, plan_items, actuals.baseline_crane_count)
     boxes = result["boxes"]
     baseline_by_no = {b.container_no: b for b in actuals.baseline_items}
@@ -1168,11 +1230,21 @@ def build_actuals_out(db: Session, actuals: models.LoadingActuals) -> dict:
             "tier": box.tier,
         })
 
+    # 更正历史：历史视图只呈现到该版本为止；当前视图呈现全部
+    all_corrections = sorted(actuals.corrections, key=lambda x: x.id)
+    corrections_view = [
+        c for c in all_corrections
+        if view_version is None or c.version <= view_version
+    ]
+    plan_status = view_plan_status or actuals.plan.status
+    version = actuals.version if view_version is None else view_version
+
     return {
         "plan_id": actuals.plan_id,
         "revision_no": actuals.plan.revision_no,
-        "plan_status": actuals.plan.status,
-        "read_only": actuals.plan.status == "superseded",
+        "plan_status": plan_status,
+        "read_only": plan_status == "superseded",
+        "version": version,
         "baseline_frozen_at": utc_iso(actuals.baseline_frozen_at),
         "baseline_crane_count": actuals.baseline_crane_count,
         "baseline": [
@@ -1194,14 +1266,279 @@ def build_actuals_out(db: Session, actuals: models.LoadingActuals) -> dict:
                 "seq": e.seq,
                 "event_type": e.event_type,
                 "container_no": e.container_no,
-                "crane_no": e.crane_no,
-                "minute": e.minute,
+                "crane_no": e._effective_crane_no,
+                "minute": e._effective_minute,
                 "registered_at": utc_iso(e.registered_at),
             }
-            for e in sorted(actuals.events, key=lambda x: x.seq)
+            for e in sorted(event_rows, key=lambda x: x.seq)
+        ],
+        "corrections": [
+            {
+                "correction_request_no": c.correction_request_no,
+                "seq": c.seq,
+                "event_type": c.event_type,
+                "container_no": c.container_no,
+                "old_minute": c.old_minute,
+                "old_crane_no": c.old_crane_no,
+                "new_minute": c.new_minute,
+                "new_crane_no": c.new_crane_no,
+                "version": c.version,
+                "created_at": utc_iso(c.created_at),
+            }
+            for c in corrections_view
         ],
         "created_at": utc_iso(actuals.created_at),
     }
+
+
+def correct_actual_event(
+    db: Session,
+    plan_id: str,
+    seq: int,
+    payload: ActualEventCorrectionIn,
+) -> tuple[models.LoadingActuals, bool, int | None, str | None]:
+    """更正一条已登记实绩事件，返回 (实绩头, 是否幂等命中, 视图版本, 视图方案状态)。
+
+    更正沿用原流水号、事件类型与箱号，只改分钟或岸桥。规则：
+
+    * 原事件不存在 → 404；方案 draft/superseded → 409（只读）；
+    * 期望版本与当前版本不一致 → 409（版本过期）；
+    * 替代事件类型/箱号与原事件不一致，或分钟与岸桥都未变 → 422；
+    * 更正后按现有规则重放**全部有效事件**，整条链非法 → 422 整次拒绝，
+      实绩、版本与更正历史均不变；
+    * 成功则版本 +1、就地更新事件、留存原值与更正历史；
+    * 同更正请求号同内容重试：即使版本已被后续更正推进，也幂等返回**首次更正
+      结果**（200），不重复生效；同请求号异内容 → 409。
+    """
+    plan = get_plan(db, plan_id)
+    plan_nos = {i.container_no for i in plan.items}
+
+    # 锁前快速预检（锁内还会再次核对）
+    if payload.seq != seq:
+        raise BusinessError(
+            f"路径流水号 {seq} 与请求体流水号 {payload.seq} 不一致，"
+            "替代事件必须沿用原事件流水号",
+            422,
+        )
+    if payload.container_no not in plan_nos:
+        raise BusinessError(
+            f"箱 {payload.container_no} 不在方案 {plan_id} 中，拒绝更正实绩",
+            422,
+        )
+
+    incoming = (
+        payload.seq, payload.event_type, payload.container_no,
+        payload.crane_no, payload.minute,
+    )
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    view_version: int | None = None
+    view_plan_status: str | None = None
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 先查同请求号：同内容重试即使版本推进也返回首次更正结果
+        cursor.execute(
+            "SELECT id FROM loading_actuals WHERE plan_id = ?",
+            (plan_id,),
+        )
+        head_row = cursor.fetchone()
+        if head_row is None:
+            conn.rollback()
+            # 方案存在（锁前已查）但无实绩头：原事件必然不存在
+            raise BusinessError(
+                f"方案 {plan_id} 尚无装船实绩登记，事件流水号 {seq} 未找到",
+                404,
+            )
+        actuals_id = head_row[0]
+
+        cursor.execute(
+            "SELECT seq, event_type, container_no, old_minute, old_crane_no, "
+            "new_minute, new_crane_no, version "
+            "FROM loading_actual_corrections WHERE actuals_id = ? "
+            "AND correction_request_no = ?",
+            (actuals_id, payload.correction_request_no),
+        )
+        prior = cursor.fetchone()
+        if prior is not None:
+            if (
+                prior[0] == incoming[0]
+                and prior[1] == incoming[1]
+                and prior[2] == incoming[2]
+                and prior[6] == incoming[3]
+                and prior[5] == incoming[4]
+            ):
+                idempotent_hit = True
+                view_version = prior[7]
+                # 首次更正时方案必为 confirmed；历史视图固定该状态以完全复现
+                view_plan_status = "confirmed"
+                conn.commit()
+            else:
+                conn.rollback()
+                raise ConflictError(
+                    f"更正请求号 {payload.correction_request_no} 已使用且更正内容"
+                    "不同，异内容冲突，本次更正被拒绝且记录不变"
+                )
+        else:
+            # 新更正：锁内复核方案状态（取代后只读）
+            cursor.execute(
+                "SELECT status FROM plans WHERE id = ?", (plan_id,)
+            )
+            plan_row = cursor.fetchone()
+            if plan_row is None:
+                conn.rollback()
+                raise BusinessError(f"方案 {plan_id} 不存在", 404)
+            plan_status_locked = plan_row[0]
+            if plan_status_locked == "draft":
+                conn.rollback()
+                raise ConflictError(
+                    "方案尚未确认（draft），无已确认装船排程，拒绝更正装船实绩"
+                )
+            if plan_status_locked == "superseded":
+                conn.rollback()
+                raise ConflictError(
+                    "方案修订已被新修订取代，其装船实绩已冻结为只读，"
+                    "不再接受更正"
+                )
+
+            cursor.execute(
+                "SELECT baseline_crane_count, version FROM loading_actuals "
+                "WHERE id = ?",
+                (actuals_id,),
+            )
+            info = cursor.fetchone()
+            crane_count, current_version = info
+            if current_version != payload.expected_version:
+                conn.rollback()
+                raise ConflictError(
+                    f"期望实绩版本 {payload.expected_version} 已过期，"
+                    f"当前版本为 {current_version}，请基于最新实绩重新更正"
+                )
+
+            # 原事件必须存在（沿用其流水号、类型与箱号）
+            cursor.execute(
+                "SELECT event_type, container_no, crane_no, minute, id "
+                "FROM loading_actual_events WHERE actuals_id = ? AND seq = ?",
+                (actuals_id, seq),
+            )
+            ev = cursor.fetchone()
+            if ev is None:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq} 未找到：该方案尚无此已登记事件，"
+                    "无可更正的原事件",
+                    404,
+                )
+            ev_type, ev_cno, cur_crane, cur_minute, ev_arrival_id = ev
+
+            if payload.event_type != ev_type:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：更正不得改变事件类型（原类型 {ev_type}，"
+                    f"提交 {payload.event_type}），替代事件只能修改分钟或岸桥",
+                    422,
+                )
+            if payload.container_no != ev_cno:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：更正不得改变箱号（原箱 {ev_cno}，"
+                    f"提交 {payload.container_no}），替代事件只能修改分钟或岸桥",
+                    422,
+                )
+            if payload.crane_no > crane_count:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：岸桥编号 {payload.crane_no} 超出冻结排程"
+                    f"岸桥数量 {crane_count}（合法编号 1..{crane_count}），"
+                    "拒绝更正",
+                    422,
+                )
+            if (
+                payload.minute == cur_minute
+                and payload.crane_no == cur_crane
+            ):
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：更正后的分钟（{cur_minute}）与岸桥"
+                    f"（{cur_crane}）均与当前有效值相同，无实质更正，拒绝受理",
+                    422,
+                )
+
+            # 以当前有效事件替换该流水号后，重放全部有效事件
+            cursor.execute(
+                "SELECT seq, event_type, container_no, crane_no, minute, id "
+                "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
+                (actuals_id,),
+            )
+            candidate_events: list[ActualEvent] = []
+            for r in cursor.fetchall():
+                candidate_events.append(ActualEvent(
+                    seq=r[0], event_type=r[1], container_no=r[2],
+                    crane_no=(
+                        payload.crane_no if r[0] == seq else r[3]
+                    ),
+                    minute=(
+                        payload.minute if r[0] == seq else r[4]
+                    ),
+                    arrival_id=r[5],
+                ))
+
+            cursor.execute(
+                "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+                (plan_id,),
+            )
+            plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+            try:
+                replay_actuals(candidate_events, plan_items, crane_count)
+            except ActualsReplayError as exc:
+                conn.rollback()
+                raise BusinessError(
+                    f"实绩更正后重放被拒绝：{exc.reason}（整次拒绝，实绩、"
+                    "版本与更正历史均不变）",
+                    422,
+                )
+
+            new_version = current_version + 1
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            # 留存原值与更正历史
+            cursor.execute(
+                "INSERT INTO loading_actual_corrections "
+                "(actuals_id, correction_request_no, seq, event_type, "
+                "container_no, old_minute, old_crane_no, new_minute, new_crane_no, "
+                "version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (actuals_id, payload.correction_request_no, seq, ev_type, ev_cno,
+                 cur_minute, cur_crane, payload.minute, payload.crane_no,
+                 new_version, now),
+            )
+            # 就地更新当前有效内容（registered_at 保留首次登记时刻）
+            cursor.execute(
+                "UPDATE loading_actual_events SET crane_no = ?, minute = ? "
+                "WHERE actuals_id = ? AND seq = ?",
+                (payload.crane_no, payload.minute, actuals_id, seq),
+            )
+            cursor.execute(
+                "UPDATE loading_actuals SET version = ? WHERE id = ?",
+                (new_version, actuals_id),
+            )
+            conn.commit()
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return _load_actuals_view(db, plan_id), idempotent_hit, view_version, view_plan_status
 
 
 def utc_iso(dt) -> str | None:

@@ -150,10 +150,31 @@ curl -s $BASE/plans/<plan_id>/schedules
 
 - 同一方案内**流水号相同、内容完全相同**的重复提交视为重试：不新增记录，返回 `200` 与**原结果**；含全新流水号的混合重试只追加新事件（`201`）；
 - 流水号相同但内容不同（类型/箱/桥/分钟任一变化）→ **冲突 `409`，记录不变**。
+- 即使事件事后已被**更正**，原登记接口仍按**首次登记内容**识别重试与冲突：以首次内容重提 → 幂等 `200`（返回的是更正后的当前有效实绩）；以其他内容重提 → `409`。需要修改已登记事件请走下方的更正接口。
+
+### 已登记事件更正（`POST /api/plans/{plan_id}/actual-events/{seq}/corrections`，请求体见 `examples/actual_event_correction.json`）
+
+发现**已登记的装船实绩分钟或岸桥录错**时，可对单条原事件发起更正。提交方案编号（路径）、**原事件流水号**（路径）、**期望实绩版本**、**更正请求号**及**替代事件的完整内容**。
+
+| 字段 | 含义 |
+| --- | --- |
+| `seq` | 路径参数 + 请求体均带且必须一致；替代事件**沿用原流水号** |
+| `expected_version` | 期望实绩版本（正整数）；必须等于服务当前版本，否则 `409`（版本过期） |
+| `correction_request_no` | 更正请求号（非空，方案内唯一）；同号同内容重试幂等返回首次更正结果 |
+| `event_type` / `container_no` | 替代事件的完整内容；**必须与原事件一致**，只允许改分钟或岸桥，否则 `422` |
+| `crane_no` / `minute` | 替代后的岸桥/分钟；**两者至少有一个相对当前有效值发生变化**，否则 `422` |
+
+处理规则：
+
+- **原事件不存在 → `404`**（方案无实绩头或该流水号未登记）；方案 `draft` 同样无实绩头 → `404`；方案已被取代（`superseded`）→ `409` 只读；
+- 更正成功后按现有规则把**全部有效事件**重新重放：**若整条链非法，整次拒绝（`422`），实绩、版本与更正历史均不变**；
+- 成功更正：实绩 **版本 +1**（首次登记为 `1`），事件当前内容就地更新（`registered_at` 保留首次登记时刻），并在更正历史中**留存更正前原值**；
+- **同更正请求号 + 同内容重试**：即使版本已被后续更正推进，也返回**首次更正结果**（`200`，对应历史版本视图），不重复生效；同请求号**异内容** → `409`；
+- 岸桥越界、改变类型/箱号、无实质更正、箱不在方案、路径与请求体流水号不一致等 → `422`。
 
 ### 查询（`GET /api/plans/{plan_id}/actuals`）
 
-返回冻结基线、每箱状态（`pending`/`in_progress`/`finished`）、实际起止分钟与实际岸桥、**相对冻结排程的偏差**（`start_delta_minutes`/`finish_delta_minutes`，正=延后、负=提前；`crane_changed`）、**未完箱列表**（未开工或已开工未完工，按箱号升序）、按分钟重放后的流水号顺序 `replay_order` 与全部已登记事件；方案被取代时 `read_only=true`。首次登记前查询返回 `404`。
+返回冻结基线、每箱状态（`pending`/`in_progress`/`finished`）、实际起止分钟与实际岸桥、**相对冻结排程的偏差**（`start_delta_minutes`/`finish_delta_minutes`，正=延后、负=提前；`crane_changed`）、**未完箱列表**（未开工或已开工未完工，按箱号升序）、按分钟重放后的流水号顺序 `replay_order`、全部**当前有效事件**、当前实绩 **`version`** 与**更正历史 `corrections`**（每条含请求号、原流水号/类型/箱号、更正前后分钟与岸桥、生效版本、时间，按版本先后）；方案被取代时 `read_only=true`。首次登记前查询返回 `404`。
 
 ### curl 示例
 
@@ -169,7 +190,13 @@ curl -s -X POST $BASE/plans/<plan_id>/actual-events \
 # 同流水号同内容重试 -> 200 返回原结果；同流水号异内容 -> 409 冲突
 # 重放非法（撞桥/下层未完工/完工桥不一致/完工不晚于开工）-> 422，记录不变
 
-# 查询：每箱状态、实际起止、相对冻结基线偏差、未完箱、重放顺序
+# 更正流水号 2 的事件（只改分钟/岸桥；期望版本须为当前版本）
+# 首次成功 201、版本+1；同请求号同内容重试 200 返回首次更正结果；
+# 版本过期/同请求号异内容 409；重放链非法 422 整次不变
+curl -s -X POST $BASE/plans/<plan_id>/actual-events/2/corrections \
+  -H 'Content-Type: application/json' -d @examples/actual_event_correction.json
+
+# 查询：每箱状态、实际起止、相对冻结基线偏差、未完箱、重放顺序、version、corrections
 curl -s $BASE/plans/<plan_id>/actuals
 ```
 
@@ -404,8 +431,9 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | POST | `/api/plans/{plan_id}/schedules` | 为**已确认方案修订**生成装船时间表（无解返回 422，不保存） |
 | GET | `/api/plans/{plan_id}/schedules` | 查询该方案修订绑定的装船时间表（历史排程可查） |
 | GET | `/api/schedules` | 列出装船时间表（默认仅当前；`?historical=true` 含历史） |
-| POST | `/api/plans/{plan_id}/actual-events` | **装船实绩**：登记逐箱实际开工/完工事件（事件可晚到、按分钟重放；首次原子冻结排程基线；201=新登记，200=同流水号同内容重试；409=无排程/方案未确认或已取代只读/流水号异内容冲突；422=箱不在方案/重放非法） |
-| GET | `/api/plans/{plan_id}/actuals` | 查询装船实绩：每箱状态、实际起止、相对冻结基线偏差与未完箱（方案取代后仍可查，`read_only=true`） |
+| POST | `/api/plans/{plan_id}/actual-events` | **装船实绩**：登记逐箱实际开工/完工事件（事件可晚到、按分钟重放；首次原子冻结排程基线；201=新登记，200=同流水号同**首次登记内容**重试；409=无排程/方案未确认或已取代只读/流水号异内容冲突；422=箱不在方案/重放非法） |
+| POST | `/api/plans/{plan_id}/actual-events/{seq}/corrections` | **更正已登记实绩事件**（沿用原流水号/类型/箱号，只改分钟或岸桥；201=首次更正成功版本+1，200=同请求号同内容重试返回首次结果；404=原事件未找到；409=版本过期/同请求号异内容/方案已取代只读；422=改类型箱号/无实质更正/重放链非法，整次不变） |
+| GET | `/api/plans/{plan_id}/actuals` | 查询装船实绩：每箱状态、实际起止、相对冻结基线偏差、未完箱、`version` 与更正历史（方案取代后仍可查，`read_only=true`） |
 | POST | `/api/plans/{plan_id}/unloading` | 为**已确认方案修订**规划逐港卸箱顺序（无可行顺序/无法确定返回 422，不保存） |
 | GET | `/api/plans/{plan_id}/unloading` | 查询该方案修订绑定的逐港卸箱顺序（历史顺序可查） |
 | GET | `/api/unloading` | 列出逐港卸箱顺序（默认仅当前；`?historical=true` 含历史） |
@@ -491,7 +519,13 @@ curl -s -X POST $BASE/plans/<plan_id>/schedules \
 #      422=箱不在方案/按分钟重放非法（撞桥、下层未完工、完工桥不一致、完工不晚于开工）
 curl -s -X POST $BASE/plans/<plan_id>/actual-events \
   -H 'Content-Type: application/json' -d @examples/actual_events.json
-curl -s $BASE/plans/<plan_id>/actuals     # 每箱状态、实际起止、偏差、未完箱、重放顺序
+# 6.2) 发现分钟/岸桥录错：凭原流水号、期望版本、更正请求号与完整替代事件更正
+#      201=更正成功（版本+1、留存原值与更正历史）；200=同请求号同内容重试；
+#      404=原事件未找到；409=版本过期/同请求号异内容/方案取代只读；422=重放链非法整次不变
+curl -s -X POST $BASE/plans/<plan_id>/actual-events/2/corrections \
+  -H 'Content-Type: application/json' -d @examples/actual_event_correction.json
+# 每箱状态、实际起止、偏差、未完箱、重放顺序、version、corrections
+curl -s $BASE/plans/<plan_id>/actuals
 
 # 7) 方案确认后规划逐港卸箱顺序（详见第六章；422=卸港序号不一致/区间倒置/无可行顺序且不保存）
 curl -s -X POST $BASE/plans/<plan_id>/unloading \
@@ -514,7 +548,7 @@ curl -s $BASE/plans/<plan_id>
 curl -s "$BASE/schedules"                 # 当前排程
 curl -s "$BASE/schedules?historical=true" # 含历史排程
 curl -s $BASE/plans/<plan_id>/schedules   # 按方案修订查排程
-curl -s $BASE/plans/<plan_id>/actuals     # 装船实绩（基线偏差/未完箱；取代后只读仍可查）
+curl -s $BASE/plans/<plan_id>/actuals     # 装船实绩（基线偏差/未完箱/version/更正历史；取代后只读仍可查）
 curl -s "$BASE/unloading"                 # 当前卸箱顺序
 curl -s "$BASE/unloading?historical=true" # 含历史卸箱顺序
 curl -s $BASE/plans/<plan_id>/unloading   # 按方案修订查卸箱顺序
@@ -556,7 +590,7 @@ pip install pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、**应急改配三阶段优选（最少换槽→最低层级→字典序）与封锁/承重/堆叠/重量次序/卸港/危邻/力矩全约束 Python 复核**、**装船实绩事件重放（同分钟完工先于开工、开工无重复/桥空闲/下层已完工、完工同桥且严格晚于开工、晚到事件使原链失效整批拒绝、同号幂等/异号冲突、基线冻结后重排与方案取代不改写、取代后只读、并发首次绑定串行化）**、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置/封锁列表空或重复或编号越修订/实绩事件入参）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序/**应急改配**保存前的方案状态/同根新修订/资料变化复核（共 127 个用例）。
+测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、**应急改配三阶段优选（最少换槽→最低层级→字典序）与封锁/承重/堆叠/重量次序/卸港/危邻/力矩全约束 Python 复核**、**装船实绩事件重放（同分钟完工先于开工、开工无重复/桥空闲/下层已完工、完工同桥且严格晚于开工、晚到事件使原链失效整批拒绝、同号幂等/异号冲突、基线冻结后重排与方案取代不改写、取代后只读、并发首次绑定串行化）、**实绩事件更正（沿用流水号/类型/箱号只改分钟或岸桥、更正后全量重放非法整次拒绝、版本递增与原值/更正历史留存、期望版本乐观锁、同请求号同内容跨版本幂等/异内容冲突、原登记接口按首次内容识别重试、取代后只读、并发版本串行化）**、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置/封锁列表空或重复或编号越修订/实绩事件入参）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序/**应急改配**保存前的方案状态/同根新修订/资料变化复核（共 146 个用例）。
 
 ## 十四、目录结构
 
@@ -570,11 +604,11 @@ app/
   scheduler.py   # 装船时间表（岸桥调度）MILP 与两阶段优选（核心）
   actuals.py     # 装船实绩事件重放引擎：晚到重排、同分钟完工先于开工、全约束校验（核心）
   unloader.py    # 逐港卸箱顺序 MILP、字典序优选与全约束 Python 复核（核心）
-  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核、实绩基线冻结与登记
+  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核、实绩基线冻结/登记/更正
   routers.py     # HTTP 路由
   main.py        # FastAPI 入口
-scripts/entrypoint.sh  # 容器初始化入口
-tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配、实绩重放）
-examples/        # 请求示例（含 schedule.json、actual_events.json、actual_event_late.json、unloading.json、restow.json）
+scripts/entrypoint.sh  # 容器初始化入口（含既有库增量加列迁移）
+tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配、实绩重放与更正）
+examples/        # 请求示例（含 schedule.json、actual_events.json、actual_event_late.json、actual_event_correction.json、unloading.json、restow.json）
 Dockerfile / docker-compose.yml / requirements.txt
 ```
