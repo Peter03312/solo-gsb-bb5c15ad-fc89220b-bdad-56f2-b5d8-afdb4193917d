@@ -49,3 +49,57 @@ def init_db() -> None:
     from app import models  # noqa: F401  确保模型已注册
 
     Base.metadata.create_all(bind=engine)
+    _apply_lightweight_migrations()
+
+
+def _apply_lightweight_migrations() -> None:
+    """对已存在的 SQLite 库幂等补齐后续版本新增列（不做破坏性变更）。
+
+    新库由 ``create_all`` 直接建出最新结构；只有历史库需要 ALTER TABLE 补列。
+    每次更正的版本链与原始事件留档列在此补齐。
+    """
+    if not settings.database_url.startswith("sqlite"):
+        return
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+
+    def columns(table: str) -> set[str]:
+        if table not in inspector.get_table_names():
+            return set()
+        return {c["name"] for c in inspector.get_columns(table)}
+
+    added_actuals = columns("loading_actuals")
+    with engine.begin() as conn:
+        if added_actuals and "version" not in added_actuals:
+            # 历史库：已有实绩均视为第 1 版（尚未发生过更正）
+            conn.execute(
+                text("ALTER TABLE loading_actuals ADD COLUMN version INTEGER "
+                     "NOT NULL DEFAULT 1")
+            )
+
+    added_events = columns("loading_actual_events")
+    with engine.begin() as conn:
+        if added_events:
+            if "orig_minute" not in added_events:
+                conn.execute(
+                    text("ALTER TABLE loading_actual_events ADD COLUMN orig_minute "
+                         "INTEGER NOT NULL DEFAULT 0")
+                )
+                # 已登记事件的原始分钟即其现行分钟
+                conn.execute(
+                    text("UPDATE loading_actual_events SET orig_minute = minute")
+                )
+            if "orig_crane_no" not in added_events:
+                conn.execute(
+                    text("ALTER TABLE loading_actual_events ADD COLUMN orig_crane_no "
+                         "INTEGER NOT NULL DEFAULT 1")
+                )
+                conn.execute(
+                    text("UPDATE loading_actual_events SET orig_crane_no = crane_no")
+                )
+            if "corrected" not in added_events:
+                conn.execute(
+                    text("ALTER TABLE loading_actual_events ADD COLUMN corrected "
+                         "BOOLEAN NOT NULL DEFAULT 0")
+                )

@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -374,6 +376,8 @@ class LoadingActuals(Base):
     baseline_frozen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
+    # 实绩版本：首次登记为 1，每次成功更正递增 1（更正重放非法则不递增）
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     events: Mapped[list["LoadingActualEvent"]] = relationship(
@@ -382,10 +386,14 @@ class LoadingActuals(Base):
     baseline_items: Mapped[list["LoadingActualBaselineItem"]] = relationship(
         back_populates="actuals", cascade="all, delete-orphan"
     )
+    corrections: Mapped[list["LoadingActualCorrection"]] = relationship(
+        back_populates="actuals", cascade="all, delete-orphan"
+    )
     plan: Mapped[Plan] = relationship()
 
     __table_args__ = (
         CheckConstraint("baseline_crane_count > 0", name="ck_actuals_cranes"),
+        CheckConstraint("version >= 1", name="ck_actuals_version"),
     )
 
 
@@ -432,6 +440,14 @@ class LoadingActualEvent(Base):
     container_no: Mapped[str] = mapped_column(String(64), nullable=False)
     crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
     minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 首次登记时的原始分钟/岸桥：原登记接口始终据此识别同流水号重试与冲突；
+    # 更正只改 minute/crane_no，这两列保留原值用于留档。未被更正时与现行值相同。
+    orig_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    orig_crane_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    corrected: Mapped[bool] = mapped_column(
+        # SQLite 无原生布尔，以 0/1 存储
+        Boolean, nullable=False, default=False
+    )
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -444,4 +460,46 @@ class LoadingActualEvent(Base):
                         name="ck_actual_event_type"),
         CheckConstraint("crane_no >= 1", name="ck_actual_event_crane"),
         CheckConstraint("minute >= 0", name="ck_actual_event_minute"),
+        CheckConstraint("orig_crane_no >= 1", name="ck_actual_event_orig_crane"),
+        CheckConstraint("orig_minute >= 0", name="ck_actual_event_orig_minute"),
+    )
+
+
+class LoadingActualCorrection(Base):
+    """一次已成功生效的实绩更正（方案内 request_id 唯一，支持幂等重试）。
+
+    更正只允许改变某条已登记事件的 minute 或 crane_no：替代事件沿用原流水号、
+    事件类型与箱号。每次成功更正把实绩 version 加 1，并把首次更正的完整查询
+    结果序列化存入 response_snapshot；同 request_id 同内容重试（即便 version
+    已被后续更正推进）直接返回该快照、不重复生效。
+    """
+
+    __tablename__ = "loading_actual_corrections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actuals_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_actuals.id", ondelete="CASCADE"), index=True
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    old_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 首次更正成功后的完整 ActualsOut 快照（JSON 文本），供同请求号重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    actuals: Mapped[LoadingActuals] = relationship(back_populates="corrections")
+
+    __table_args__ = (
+        UniqueConstraint("actuals_id", "request_id",
+                         name="uq_actual_correction_request"),
     )

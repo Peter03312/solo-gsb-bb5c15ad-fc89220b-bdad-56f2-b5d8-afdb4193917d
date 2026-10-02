@@ -41,6 +41,7 @@ def _clean_tables():
     db = SessionLocal()
     try:
         db.query(models.LoadingActualEvent).delete()
+        db.query(models.LoadingActualCorrection).delete()
         db.query(models.LoadingActualBaselineItem).delete()
         db.query(models.LoadingActuals).delete()
         db.query(models.LoadingScheduleItem).delete()

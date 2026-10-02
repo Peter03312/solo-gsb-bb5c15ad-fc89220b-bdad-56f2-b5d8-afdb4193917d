@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app import services
 from app.database import get_db
 from app.schemas import (
+    ActualEventCorrectionIn,
     ActualEventRegisterIn,
     ActualsOut,
     AssignmentOut,
@@ -387,6 +388,25 @@ def register_actual_events(
     # 同流水号同内容重试返回原结果（200），新事件登记成功为 201
     response.status_code = 200 if idempotent_hit else 201
     return services.build_actuals_out(db, actuals)
+
+
+@router.post(
+    "/plans/{plan_id}/actual-events/correction",
+    response_model=ActualsOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="更正已登记实绩事件的分钟或岸桥（沿用原流水号/类型/箱号；版本递增、留更正历史）",
+)
+def correct_actual_event(
+    plan_id: str,
+    body: ActualEventCorrectionIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    out, idempotent_hit = services.correct_actual_event(db, plan_id, body)
+    # 同更正请求号同内容重试返回首次更正结果（200）；新更正生效为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return out
 
 
 @router.get(
